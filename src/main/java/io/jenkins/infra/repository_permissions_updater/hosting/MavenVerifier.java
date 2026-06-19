@@ -1,6 +1,8 @@
 package io.jenkins.infra.repository_permissions_updater.hosting;
 
-import static io.jenkins.infra.repository_permissions_updater.hosting.HostingChecker.LOWEST_JENKINS_VERSION;
+import static io.jenkins.infra.repository_permissions_updater.hosting.Requirements.LOWEST_JENKINS_VERSION;
+import static io.jenkins.infra.repository_permissions_updater.hosting.Requirements.LOWEST_PARENT_POM_VERSION;
+import static io.jenkins.infra.repository_permissions_updater.hosting.Requirements.PARENT_POM_WITH_JENKINS_VERSION;
 import static java.util.regex.Pattern.CASE_INSENSITIVE;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
@@ -36,6 +38,9 @@ import org.apache.maven.model.Model;
 import org.apache.maven.model.Parent;
 import org.apache.maven.model.Repository;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
+import org.codehaus.plexus.interpolation.InterpolationException;
+import org.codehaus.plexus.interpolation.MapBasedValueSource;
+import org.codehaus.plexus.interpolation.RegexBasedInterpolator;
 import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 import org.kohsuke.github.GHContent;
 import org.kohsuke.github.GHFileNotFoundException;
@@ -49,9 +54,6 @@ public class MavenVerifier implements BuildSystemVerifier {
     private static final int MAX_LENGTH_OF_GROUP_ID_PLUS_ARTIFACT_ID = 100;
     private static final int MAX_LENGTH_OF_ARTIFACT_ID = 37;
     private static final Logger LOGGER = LoggerFactory.getLogger(MavenVerifier.class);
-
-    public static final Version LOWEST_PARENT_POM_VERSION = new Version(5, 9);
-    public static final Version PARENT_POM_WITH_JENKINS_VERSION = new Version(2);
 
     public static final String INVALID_POM = "The pom.xml file in the root of the origin repository is not valid";
     public static final String SPECIFY_LICENSE =
@@ -99,6 +101,10 @@ public class MavenVerifier implements BuildSystemVerifier {
                             checkDependencyManagement(model, hostingIssues);
                             checkDevelopersTag(model, hostingIssues);
                             checkProperties(model, hostingIssues);
+                            checkUrl(model, hostingIssues);
+                            if (issue.isEnableCD()) {
+                                checkAutomaticReleasesSettings(model, hostingIssues);
+                            }
                         } catch (Exception e) {
                             LOGGER.error("Failed looking at pom.xml", e);
                             hostingIssues.add(
@@ -117,17 +123,50 @@ public class MavenVerifier implements BuildSystemVerifier {
         }
     }
 
+    private void checkUrl(Model model, HashSet<VerificationMessage> hostingIssues) {
+        Properties props = model.getProperties();
+        props.put("project.artifactId", model.getArtifactId());
+        RegexBasedInterpolator interpolator = new RegexBasedInterpolator();
+        interpolator.addValueSource(new MapBasedValueSource(props));
+        String url = model.getUrl();
+        try {
+            url = interpolator.interpolate(url);
+            if (!url.equals("https://github.com/jenkinsci/" + model.getArtifactId() + "-plugin")) {
+                hostingIssues.add(
+                        new VerificationMessage(
+                                VerificationMessage.Severity.REQUIRED,
+                                "The `<url>` field in the pom.xml should be `https://github.com/jenkinsci/${project.artifactId}-plugin`."));
+            }
+        } catch (InterpolationException e) {
+            LOGGER.warn("Failed to interpolate url", e);
+        }
+    }
+
     @Override
     public boolean hasBuildFile(HostingRequest issue) throws IOException {
         return HostingChecker.fileExistsInRepo(issue, "pom.xml");
+    }
+
+    private void checkAutomaticReleasesSettings(Model model, HashSet<VerificationMessage> hostingIssues) {
+        Properties props = model.getProperties();
+        if (!props.containsKey("changelist") || !props.getProperty("changelist").equals("999999-SNAPSHOT")) {
+            hostingIssues.add(new VerificationMessage(
+                    VerificationMessage.Severity.REQUIRED,
+                    "The property `changelist` must be defined and set to `999999-SNAPSHOT` when CD is enabled."));
+        }
+        String version = model.getVersion();
+        if (!version.contains("${changelist}")) {
+            hostingIssues.add(new VerificationMessage(
+                    VerificationMessage.Severity.REQUIRED,
+                    "The version in the pom.xml must contain `${changelist}` when CD is enabled."));
+        }
     }
 
     private void checkArtifactId(Model model, String forkTo, HashSet<VerificationMessage> hostingIssues) {
         try {
             if (StringUtils.isBlank(forkTo)) {
                 hostingIssues.add(new VerificationMessage(
-                        VerificationMessage.Severity.REQUIRED,
-                        "Missing value in Jira for 'New Repository Name' field"));
+                        VerificationMessage.Severity.REQUIRED, "Missing value for 'New Repository Name' field"));
             }
 
             String groupId = model.getGroupId();
@@ -418,6 +457,7 @@ public class MavenVerifier implements BuildSystemVerifier {
                                 && d.getArtifactId().startsWith("bom-"))
                         .findFirst();
             }
+
             Set<String> managedDependencies;
             String bomArtifactId = "bom-" + jenkinsVersion.baseline() + ".x";
             String latestReleasedBom = getLatestBomVersion(bomArtifactId);
@@ -438,8 +478,22 @@ public class MavenVerifier implements BuildSystemVerifier {
                                         + " See [here](https://www.jenkins.io/doc/developer/plugin-development/dependency-management/#jenkins-plugin-bom) for details."));
             }
             if (bom.isPresent()) {
+                Properties props = model.getProperties();
+                RegexBasedInterpolator interpolator = new RegexBasedInterpolator();
+                interpolator.addValueSource(new MapBasedValueSource(props));
+
                 Dependency dep = bom.get();
-                if (latestReleasedBom != null && !latestReleasedBom.equals(dep.getVersion())) {
+                String version = dep.getVersion();
+                try {
+                    version = interpolator.interpolate(version);
+                } catch (Exception e) {
+                    LOGGER.error("Error interpolating bom version", e);
+                    dependencyManagementIssues.add(new VerificationMessage(
+                            VerificationMessage.Severity.REQUIRED,
+                            "There was an error trying to interpolate the bom version `%s`. Please make sure that all properties used in the version are defined and can be interpolated correctly.",
+                            dep.getVersion()));
+                }
+                if (latestReleasedBom != null && !latestReleasedBom.equals(version)) {
                     dependencyManagementIssues.add(new VerificationMessage(
                             VerificationMessage.Severity.REQUIRED,
                             "The bom version `%s` of `%s` should be updated to the latest version `%s`",
@@ -479,7 +533,8 @@ public class MavenVerifier implements BuildSystemVerifier {
 
     private void checkProperties(Model model, HashSet<VerificationMessage> hostingIssues) {
         Properties props = model.getProperties();
-        List<String> illegalProps = Arrays.asList("java.level", "maven.compiler.source", "maven.compiler.target");
+        List<String> illegalProps =
+                Arrays.asList("java.level", "maven.compiler.source", "maven.compiler.target", "maven.compiler.release");
         illegalProps.forEach(p -> {
             if (props.containsKey(p)) {
                 hostingIssues.add(new VerificationMessage(
@@ -493,6 +548,35 @@ public class MavenVerifier implements BuildSystemVerifier {
                     new VerificationMessage(
                             VerificationMessage.Severity.REQUIRED,
                             "Please define the property `jenkins.baseline` and use this property in `<jenkins.version>${jenkins.baseline}.3</jenkins.version>` and the artifactId of the bom."));
+        }
+        if (!props.containsKey("hpi.strictBundledArtifacts")
+                || !props.getProperty("hpi.strictBundledArtifacts").equals("true")) {
+            hostingIssues.add(
+                    new VerificationMessage(
+                            VerificationMessage.Severity.REQUIRED,
+                            "Please define the property `hpi.strictBundledArtifacts` and set it to `true`. This should help prevent accidental library bundling when adding and updating dependencies."
+                                    + "See [Bundling third-party libraries](https://www.jenkins.io/doc/developer/plugin-development/dependencies-and-class-loading/#bundling-third-party-libraries)."));
+        }
+        if (!props.containsKey("ban-commons-lang-2.skip")
+                || !props.getProperty("ban-commons-lang-2.skip").equals("false")) {
+            hostingIssues.add(new VerificationMessage(
+                    VerificationMessage.Severity.REQUIRED,
+                    "Please define the property `ban-commons-lang-2.skip` and set it to `false`. This should help prevent accidental usage of the deprecated commons-lang-2 library that is "
+                            + "included in core."));
+        }
+        if (!props.containsKey("ban-deprecated-stapler.skip")
+                || !props.getProperty("ban-deprecated-stapler.skip").equals("false")) {
+            hostingIssues.add(new VerificationMessage(
+                    VerificationMessage.Severity.REQUIRED,
+                    "Please define the property `ban-deprecated-stapler.skip` and set it to `false`. This should help prevent usage of deprecated stapler and javax.servlet classes."
+                            + " included in core."));
+        }
+        if (!props.containsKey("ban-junit4-imports.skip")
+                || !props.getProperty("ban-junit4-imports.skip").equals("false")) {
+            hostingIssues.add(
+                    new VerificationMessage(
+                            VerificationMessage.Severity.REQUIRED,
+                            "Please define the property `ban-junit4-imports.skip` and set it to `false`. This should help prevent usage of deprecated junit 4 classes."));
         }
     }
 
@@ -542,18 +626,22 @@ public class MavenVerifier implements BuildSystemVerifier {
 
     private JenkinsVersion getJenkinsVersion(Model model) {
         Properties props = model.getProperties();
+        RegexBasedInterpolator interpolator = new RegexBasedInterpolator();
+        interpolator.addValueSource(new MapBasedValueSource(props));
         if (props.containsKey("jenkins.version")) {
-            String baseline = props.getProperty("jenkins.baseline");
-            String version = props.getProperty("jenkins.version");
-            if (baseline != null && version.contains("${jenkins.baseline}")) {
-                version = version.replace("${jenkins.baseline}", baseline);
-            } else {
-                Matcher m = Pattern.compile("(\\d\\.\\d+)(|\\.\\d)").matcher(version);
-                if (m.matches()) {
-                    baseline = m.group(1);
+            try {
+                String version = interpolator.interpolate(props.getProperty("jenkins.version"));
+                String baseline = interpolator.interpolate(props.getProperty("jenkins.baseline"));
+                if (baseline == null || baseline.isBlank()) {
+                    Matcher m = Pattern.compile("(\\d\\.\\d+)(|\\.\\d)").matcher(version);
+                    if (m.matches()) {
+                        baseline = m.group(1);
+                    }
                 }
+                return new JenkinsVersion(baseline, new Version(version));
+            } catch (Exception e) {
+                LOGGER.warn("Failed to interpolate jenkins.version", e);
             }
-            return new JenkinsVersion(baseline, new Version(version));
         }
         return null;
     }

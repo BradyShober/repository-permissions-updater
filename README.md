@@ -190,6 +190,20 @@ issues:
   - github: *GH # Use the reference
 ```
 
+### Migrating from Jira to GitHub issue trackers
+
+Send a pull request to this repository removing the Jira reference and changing it to GitHub.
+Use this script to automate the required file change and open a draft pull request:
+
+```
+./bin/migrate-to-github.sh permissions/plugin-slack.yml
+
+# Multiple files can be done at once:
+./bin/migrate-to-github.sh permissions/plugin-slack.yml permissions/plugin-dark-theme.yml 
+```
+
+A maintainer / Jenkins infra team member will then be able to perform the migration on your behalf.
+
 ### Consuming Issue Trackers
 
 A file `issues.index.json` is generated when the tool is executed, containing a map from component names to a list of issue trackers.
@@ -212,9 +226,20 @@ Further issue trackers are mostly provided as a reference, e.g. when listing exi
 Usage
 -----
 
-To see how to run this tool to synchronize Artifactory permission targets with the definitions in this repository, see `Jenkinsfile`.
+This tool provides a unified CLI with subcommands. See `Jenkinsfile` for the `sync` command and GitHub Actions workflows for hosting commands.
 
-The following Java system properties can be used to customize the tool's behavior:
+Available commands:
+```bash
+RPU_CLI="java -jar target/repository-permissions-updater-*-bin/repository-permissions-updater-*.jar"
+
+$RPU_CLI sync
+$RPU_CLI check-hosting <issue-id>
+$RPU_CLI host <issue-id>
+```
+
+### Configuration
+
+The following Java system properties can be used to customize the behavior of the `sync` command:
 
 * `dryRun` - Set to `true` to generate the API payloads without submitting them. No modifications will be executed.
 * `development` - Set to `true` during tool development to ensure production data is not overridden. This will have the following effects:
@@ -233,7 +258,13 @@ The following Java system properties can be used to customize the tool's behavio
 * `jiraUserNamesJsonListUrl` - URL to a list containing known Jira user names of (potential) maintainers.
   This is essentially a workaround to reduce the number of individual user lookups via Jira API.
 
-It expected the following environment variables to be set:
+The following Java system properties can be used for the `check-hosting` command:
+
+* `debugHosting` - Set to `true` to enable debug mode.
+
+### Environment Variables
+
+The following environment variables are expected to be set:
 
 - `ARTIFACTORY_USERNAME` - Admin user name for Artifactory
 - `ARTIFACTORY_PASSWORD` - Corresponding admin password (or API key) for Artifactory admin user

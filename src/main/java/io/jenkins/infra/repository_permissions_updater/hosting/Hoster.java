@@ -3,33 +3,21 @@ package io.jenkins.infra.repository_permissions_updater.hosting;
 import static io.jenkins.infra.repository_permissions_updater.hosting.HostingConfig.HOSTING_REPO_NAME;
 import static io.jenkins.infra.repository_permissions_updater.hosting.HostingConfig.HOSTING_REPO_SLUG;
 import static io.jenkins.infra.repository_permissions_updater.hosting.HostingConfig.INFRA_ORGANIZATION;
-import static io.jenkins.infra.repository_permissions_updater.hosting.HostingConfig.JIRA_PROJECT;
 import static io.jenkins.infra.repository_permissions_updater.hosting.HostingConfig.TARGET_ORG_NAME;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 import static java.util.regex.Pattern.CASE_INSENSITIVE;
 import static java.util.stream.Collectors.joining;
 
-import com.atlassian.jira.rest.client.api.ComponentRestClient;
-import com.atlassian.jira.rest.client.api.JiraRestClient;
-import com.atlassian.jira.rest.client.api.domain.AssigneeType;
-import com.atlassian.jira.rest.client.api.domain.BasicComponent;
-import com.atlassian.jira.rest.client.api.domain.Component;
-import com.atlassian.jira.rest.client.api.domain.input.ComponentInput;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import io.atlassian.util.concurrent.Promise;
-import io.jenkins.infra.repository_permissions_updater.hosting.HostingRequest.IssueTracker;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.kohsuke.github.GHContent;
@@ -50,21 +38,15 @@ public class Hoster {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(Hoster.class);
 
-    public static void main(String[] args) {
-        new Hoster().run(Integer.parseInt(args[0]));
-    }
-
-    private void run(int issueID) {
+    public void run(int issueID) {
         LOGGER.info("Approving hosting request {}", issueID);
 
-        JiraRestClient client = null;
         try {
             final HostingRequest hostingRequest = HostingRequestParser.retrieveAndParse(issueID);
 
-            String defaultAssignee = hostingRequest.getJenkinsProjectUsers().getFirst();
             String forkFrom = hostingRequest.getRepositoryUrl();
             List<String> users = hostingRequest.getGithubUsers();
-            IssueTracker issueTrackerChoice = hostingRequest.getIssueTracker();
+            boolean enableCD = hostingRequest.isEnableCD();
 
             String forkTo = hostingRequest.getNewRepoName();
 
@@ -79,8 +61,7 @@ public class Hoster {
             Matcher m = Pattern.compile("(?:https://github\\.com/)?(\\S+)/(\\S+)", CASE_INSENSITIVE)
                     .matcher(forkFrom);
             if (m.matches()) {
-                if (!forkGitHub(
-                        issueID, m.group(1), m.group(2), forkTo, users, issueTrackerChoice == IssueTracker.GITHUB)) {
+                if (!forkGitHub(issueID, m.group(1), m.group(2), forkTo, users)) {
                     LOGGER.error("Hosting request failed to fork repository on Github");
                     return;
                 }
@@ -91,35 +72,8 @@ public class Hoster {
                 return;
             }
 
-            // create the JIRA component
-            if (issueTrackerChoice == IssueTracker.JIRA && !createComponent(forkTo, defaultAssignee)) {
-                String msg = "Hosting request failed to create component " + forkTo + " in JIRA";
-                LOGGER.error(msg);
-                reportHostingFailure(issueID, msg);
-                return;
-            }
-
-            client = JiraHelper.createJiraClient();
-            String componentId = "";
-            try {
-                if (issueTrackerChoice == IssueTracker.JIRA) {
-                    BasicComponent component = JiraHelper.getBasicComponent(client, JIRA_PROJECT, forkTo);
-                    if (component.getId() != null) {
-                        componentId = component.getId().toString();
-                    }
-                }
-            } catch (IOException | TimeoutException | ExecutionException | InterruptedException ex) {
-                LOGGER.error("Could not get component ID for {} component in Jira", forkTo);
-                componentId = "";
-            }
-
-            String prUrl = createUploadPermissionPR(
-                    issueID,
-                    forkTo,
-                    users,
-                    hostingRequest.getJenkinsProjectUsers(),
-                    issueTrackerChoice == IssueTracker.GITHUB,
-                    componentId);
+            String prUrl =
+                    createUploadPermissionPR(issueID, forkTo, users, hostingRequest.getJenkinsProjectUsers(), enableCD);
             if (StringUtils.isBlank(prUrl)) {
                 String msg = "Could not create upload permission pull request";
                 LOGGER.error(msg);
@@ -137,15 +91,7 @@ public class Hoster {
             }
 
             String issueTrackerText;
-            if (issueTrackerChoice == IssueTracker.JIRA) {
-                issueTrackerText = "\n\nA Jira component named [" + forkTo
-                        + "](https://issues.jenkins.io/issues/?jql=project+%3D+JENKINS+AND+component+%3D+" + forkTo
-                        + ")" + " has also been created with `" + defaultAssignee
-                        + "` as the default assignee for issues.";
-            } else {
-                issueTrackerText =
-                        "\n\nGitHub issues has been selected for issue tracking and was enabled for the forked repo.";
-            }
+            issueTrackerText = "\n\nGitHub issues have been enabled for the forked repo.";
 
             // update the issue with information on next steps
             String msg = "Hosting request complete, the code has been forked into the jenkinsci project on GitHub as "
@@ -173,10 +119,6 @@ public class Hoster {
             LOGGER.info("Hosting setup complete");
         } catch (IOException e) {
             LOGGER.error("Failed setting up hosting for {}. ", issueID, e);
-        } finally {
-            if (!JiraHelper.close(client)) {
-                LOGGER.warn("Failed to close JIRA client, possible leaked file descriptors");
-            }
         }
     }
 
@@ -195,8 +137,7 @@ public class Hoster {
         return true;
     }
 
-    boolean forkGitHub(
-            int issueID, String owner, String repo, String newName, List<String> maintainers, boolean useGHIssues) {
+    boolean forkGitHub(int issueID, String owner, String repo, String newName, List<String> maintainers) {
         boolean result = false;
         try {
 
@@ -240,10 +181,10 @@ public class Hoster {
 
             GHRepository r;
             try {
-                r = orig.forkTo(org);
+                r = orig.createFork().organization(org).create();
             } catch (IOException e) {
                 // we started seeing 500 errors, presumably due to time out.
-                // give it a bit of time, and see if the repository is there
+                // give it a bit of time and see if the repository is there
                 LOGGER.info("GitHub reported that it failed to fork {}/{}. But we aren't trusting", owner, repo);
                 r = null;
                 for (int i = 0; r == null && i < 5; i++) {
@@ -259,7 +200,7 @@ public class Hoster {
                         renameResult = renameRepository(r, newName);
                         break;
                     } catch (HttpException e) {
-                        LOGGER.warn("Failed to rename repository from {} to {}", repo, newName, e);
+                        LOGGER.warn("Failed to rename repository from {} to {}", repo, newName);
                         if (e.getResponseCode() == 422) {
                             Thread.sleep(2000);
                         } else {
@@ -268,6 +209,7 @@ public class Hoster {
                         }
                     }
                 }
+                LOGGER.info("Renamed repository from {} to {}", repo, newName);
                 if (!renameResult) {
                     throw new IOException(
                             "Failed to rename repository from " + repo + " to " + newName + " after 5 tries.");
@@ -293,7 +235,7 @@ public class Hoster {
                 LOGGER.warn("Failed to add {} to the new repository. Maybe an org?: {}", user, e.getMessage());
                 // fall through
             }
-            setupRepository(r, useGHIssues);
+            setupRepository(r);
 
             LOGGER.info("Created https://github.com/{}/{}", TARGET_ORG_NAME, newName != null ? newName : repo);
 
@@ -316,13 +258,18 @@ public class Hoster {
     /**
      * Fix up the repository set up to our policy.
      */
-    private static void setupRepository(GHRepository r, boolean useGHIssues) throws IOException {
-        r.enableIssueTracker(useGHIssues);
+    private static void setupRepository(GHRepository r) throws IOException {
+        r.enableIssueTracker(true);
         r.enableWiki(false);
         r.setHomepage("https://plugins.jenkins.io/" + r.getName().replace("-plugin", "") + "/");
         r.createAutolink()
                 .withKeyPrefix("JENKINS-")
-                .withUrlTemplate("https://issues.jenkins.io/browse/JENKINS-<num>")
+                .withUrlTemplate("https://issue-redirect.jenkins.io/browse/JENKINS-<num>")
+                .withIsAlphanumeric(false)
+                .create();
+        r.createAutolink()
+                .withKeyPrefix("SECURITY-")
+                .withUrlTemplate("https://jenkins.io/security/issue/SECURITY-<num>")
                 .withIsAlphanumeric(false)
                 .create();
     }
@@ -339,9 +286,9 @@ public class Hoster {
             List<String> maintainers = emptyList();
             if (!githubUsers.isEmpty()) {
                 maintainers = githubUsers.stream()
-                        // in order to be added as a maintainer of a team you have to be a member of the org already
+                        // to be added as a maintainer of a team, you have to be a member of the org already
                         .filter(user -> isMemberOfOrg(github, org, user))
-                        .collect(Collectors.toList());
+                        .toList();
                 ghCreateTeamBuilder = ghCreateTeamBuilder.maintainers(maintainers.toArray(new String[0]));
             }
             t = ghCreateTeamBuilder.create();
@@ -350,14 +297,12 @@ public class Hoster {
             usersNotInMaintainers.removeAll(maintainers);
             final GHTeam team = t;
             usersNotInMaintainers.forEach(addUserToTeam(github, team));
-            // github automatically adds the user to the team who created the team, we don't want that
+            // GitHub automatically adds the user to the team who created the team, we don't want that
             team.remove(github.getMyself());
         }
 
-        t.add(
-                r,
-                GHOrganization.Permission
-                        .ADMIN); // make team an admin on the given repository, always do in case the config is wrong
+        // make team an admin on the given repository, always do in case the config is wrong
+        t.add(r, GHOrganization.RepositoryRole.from(GHOrganization.Permission.ADMIN));
         return t;
     }
 
@@ -383,12 +328,7 @@ public class Hoster {
 
     @SuppressFBWarnings(value = "VA_FORMAT_STRING_USES_NEWLINE", justification = "TODO needs triage")
     String createUploadPermissionPR(
-            int issueId,
-            String forkTo,
-            List<String> ghUsers,
-            List<String> releaseUsers,
-            boolean useGHIssues,
-            String jiraComponentId) {
+            int issueId, String forkTo, List<String> ghUsers, List<String> releaseUsers, boolean enableCD) {
         String prUrl = "";
         boolean isPlugin = forkTo.endsWith("-plugin");
         if (isPlugin) {
@@ -429,18 +369,17 @@ public class Hoster {
                 content += developerBuilder.toString();
 
                 content += "issues:\n";
-                if (useGHIssues) {
-                    content += "  - github: *GH\n";
-                } else if (StringUtils.isNotEmpty(jiraComponentId)) {
-                    content += "  - jira: " + jiraComponentId + "\n";
+                content += "  - github: *GH\n";
+
+                if (enableCD) {
+                    content += "cd:\n  enabled: true\n";
                 }
 
                 builder.content(content)
                         .path("permissions/plugin-" + forkTo.replace("-plugin", "") + ".yml")
                         .commit();
 
-                String prText =
-                        """
+                String prText = """
                         Hello from your friendly Jenkins Hosting Bot!
                         This is an automatically created PR for:
                         - #%s
@@ -448,12 +387,11 @@ public class Hoster {
                         The user(s) listed in the permissions file may not have logged in to Artifactory yet, check the PR status.
                         To check again, hosting team members will retrigger the build using Checks area or by closing and reopening the PR.
                         cc %s
-                        """
-                                .formatted(
-                                        issueId,
-                                        TARGET_ORG_NAME,
-                                        forkTo,
-                                        ghUsers.stream().map(u -> "@" + u).collect(joining(", ")));
+                        """.formatted(
+                                issueId,
+                                TARGET_ORG_NAME,
+                                forkTo,
+                                ghUsers.stream().map(u -> "@" + u).collect(joining(", ")));
 
                 GHPullRequest pr = repo.createPullRequest(
                         "Add upload permissions for " + forkTo, branchName, repo.getDefaultBranch(), prText);
@@ -500,31 +438,5 @@ public class Hoster {
             res = "%s/%s".formatted(groupId.replace('.', '/'), artifactId);
         }
         return res;
-    }
-
-    private boolean createComponent(String subcomponent, String owner) {
-        LOGGER.info("Adding a new JIRA subcomponent %s to the %s project, owned by %s"
-                .formatted(subcomponent, JIRA_PROJECT, owner));
-
-        boolean result = false;
-        JiraRestClient client = null;
-        try {
-            client = JiraHelper.createJiraClient();
-            final ComponentRestClient componentClient = client.getComponentClient();
-            final Promise<Component> createComponent = componentClient.createComponent(
-                    JIRA_PROJECT, new ComponentInput(subcomponent, "subcomponent", owner, AssigneeType.COMPONENT_LEAD));
-            final Component component = JiraHelper.wait(createComponent);
-            LOGGER.info("New component created. URL is {}", component.getSelf().toURL());
-            result = true;
-        } catch (Exception e) {
-            LOGGER.error("Failed to create a new component: ", e);
-            e.printStackTrace();
-        } finally {
-            if (!JiraHelper.close(client)) {
-                LOGGER.warn("Failed to close JIRA client, possible leaked file descriptors");
-            }
-        }
-
-        return result;
     }
 }

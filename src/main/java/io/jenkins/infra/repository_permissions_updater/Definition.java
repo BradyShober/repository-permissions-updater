@@ -4,7 +4,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-@SuppressFBWarnings({"URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD", "UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD"})
+@SuppressFBWarnings("UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD")
 public class Definition {
 
     public static class CD {
@@ -123,6 +123,7 @@ public class Definition {
     private IssueTracker[] issues = new IssueTracker[0];
     private String[] extraNames = new String[0];
     private boolean releaseBlocked;
+    private boolean communityPluginMaintainers;
 
     private String github;
 
@@ -191,6 +192,14 @@ public class Definition {
 
     public void setReleaseBlocked(boolean releaseBlocked) {
         this.releaseBlocked = releaseBlocked;
+    }
+
+    public boolean isCommunityPluginMaintainers() {
+        return communityPluginMaintainers;
+    }
+
+    public void setCommunityPluginMaintainers(boolean communityPluginMaintainers) {
+        this.communityPluginMaintainers = communityPluginMaintainers;
     }
 
     public String getGithub() {
